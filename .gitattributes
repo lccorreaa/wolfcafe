@@ -1,0 +1,26 @@
+# Normalize text files to LF inside the repository, and check them out with the
+# line endings native to whichever machine cloned it.  Without this, a file
+# committed from Windows and a file committed from macOS differ on every line.
+* text=auto
+
+# The Maven wrapper is run by a POSIX shell on the CI runner, so it has to keep
+# LF endings even when checked out on Windows.  CRLF here produces a
+# "bad interpreter" failure that is hard to recognise.
+mvnw text eol=lf
+*.sh text eol=lf
+
+# Windows scripts need the opposite.
+mvnw.cmd text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Files Git must never rewrite.
+*.jar binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary

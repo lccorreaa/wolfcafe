@@ -1,0 +1,269 @@
+name: Build and Static Analysis
+
+on:
+  # Every commit pushed to any branch gets built.  There is deliberately no
+  # `pull_request` trigger: for a branch in this repository both triggers would
+  # fire and build the same commit twice.  The result still appears on a pull
+  # request, because GitHub attaches the check to the commit SHA rather than to
+  # the pull request itself.
+  push:
+    branches: [ "**" ]
+
+  # Allows you to re-run the build manually from the Actions tab.
+  workflow_dispatch:
+
+# One run at a time per branch.  Pushing several commits in quick succession
+# cancels the superseded runs instead of queueing all of them on the shared
+# self-hosted runner.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: nothing here writes back to the repository, so the automatic
+# token only needs read access.  No repository or organization secrets are used
+# anywhere in this workflow.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build backend
+    runs-on: [ campus ]
+
+    defaults:
+      run:
+        working-directory: wolf-cafe-backend
+
+    # MySQL for the repository, service, and controller tests.  The runner starts
+    # this container before the first step and removes it when the job ends, so
+    # every run gets an empty database and no state carries between runs.
+    #
+    # The credentials below are deliberately written out rather than kept in
+    # secrets.  The container is reachable only from this job, on a port the
+    # runner picks at random, and it is destroyed when the job finishes - there
+    # is nothing here worth protecting, and no secret for anyone to create.
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: wolfcafe_test
+        # Publishing 3306 without naming a host port makes the runner pick a free
+        # one, so two jobs on this shared self-hosted runner cannot collide over
+        # the port.  The port it chose is read back in `env` below.
+        ports:
+          - 3306
+        # The health check is what makes the build wait for MySQL to be ready.
+        # No step starts until `mysqladmin ping` succeeds inside the container.
+        options: >-
+          --health-cmd="mysqladmin ping --silent"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=12
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      # The base project is handed out as a folder copy rather than a clone, which
+      # costs the wrapper two different ways.  `mvnw` can arrive without its
+      # executable bit and get committed as mode 100644, and a copy that expands a
+      # `*` glob skips dot-entries entirely, so the whole `.mvn` directory can go
+      # missing.  Catch the second here rather than letting it surface as
+      # `./mvnw: 109: cannot open ./.mvn/wrapper/maven-wrapper.properties`, and fix
+      # the first outright.
+      - name: Check the Maven wrapper
+        run: |
+          if [ ! -f .mvn/wrapper/maven-wrapper.properties ]; then
+            echo "::error file=wolf-cafe-backend/.mvn/wrapper/maven-wrapper.properties::The Maven wrapper is missing.  wolf-cafe-backend/.mvn/ is not committed, so neither this build nor ./mvnw on your own machine can run.  Copy the .mvn directory from the base project into wolf-cafe-backend/ and commit it."
+            exit 1
+          fi
+          chmod +x mvnw
+
+      # `verify` does the whole job: Checkstyle (bound to `validate` in pom.xml),
+      # compile, the tests against the service container above, and the JaCoCo
+      # coverage report.  A failing test fails the build.
+      - name: Build, test, and measure coverage
+        env:
+          # These feed the ${NAME:default} placeholders in
+          # wolf-cafe-backend/src/test/resources/application.properties.  Nothing rewrites
+          # that file; the tests read these straight out of the environment.
+          #
+          # The `job` context is only available to a step, not to a job-level `env`
+          # block, so these live here rather than beside `services` above.
+          #
+          # If the runner is ever changed to execute jobs inside a container rather
+          # than directly on the host, MYSQL_HOST becomes the service name `mysql`
+          # and MYSQL_PORT becomes a plain 3306.
+          MYSQL_HOST: 127.0.0.1
+          MYSQL_PORT: ${{ job.services.mysql.ports['3306'] }}
+          MYSQL_USER: root
+          MYSQL_PASSWORD: root
+        run: ./mvnw -B verify
+
+      # Puts the coverage numbers on the run's summary page (the run's top-level
+      # page in the Actions tab), and in this step's log, so they are visible
+      # without downloading anything.  Reads the report JaCoCo just wrote; if the
+      # build failed before reaching it, it says so rather than failing again.
+      - name: Summarize coverage
+        if: always()
+        run: |
+          report=target/site/jacoco-ut/jacoco.xml
+          if [ ! -f "$report" ]; then
+            echo "No coverage report was produced - the build failed before the tests finished." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "### Test coverage"
+            echo
+            echo "| Metric | Covered | Total | Percent |"
+            echo "| --- | ---: | ---: | ---: |"
+            for metric in INSTRUCTION BRANCH LINE METHOD CLASS; do
+              counter=$(grep -o "type=\"$metric\" missed=\"[0-9]*\" covered=\"[0-9]*\"" "$report" | tail -1)
+              [ -n "$counter" ] || continue
+              missed=${counter#*missed=\"}; missed=${missed%%\"*}
+              covered=${counter#*covered=\"}; covered=${covered%%\"*}
+              total=$((missed + covered))
+              [ "$total" -gt 0 ] || continue
+              echo "| $metric | $covered | $total | $((covered * 100 / total))% |"
+            done
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Generate the Checkstyle report
+        if: always()
+        run: ./mvnw -B checkstyle:checkstyle
+
+      # Everything a student needs to read after a failed build: the per-test
+      # results, the browsable coverage report, and the Checkstyle report.
+      - name: Upload the backend reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: backend-reports
+          path: |
+            wolf-cafe-backend/target/surefire-reports/
+            wolf-cafe-backend/target/site/jacoco-ut/
+            wolf-cafe-backend/target/reports/
+            wolf-cafe-backend/target/checkstyle-result.xml
+          if-no-files-found: warn
+
+  lint:
+    name: Lint frontend
+    runs-on: [ campus ]
+
+    defaults:
+      run:
+        working-directory: wolf-cafe-frontend
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: wolf-cafe-frontend/package-lock.json
+
+      - name: Install the dependencies
+        run: npm ci
+
+      # Like Checkstyle, ESLint reports problems here without turning this job
+      # red; the Quality job below is what flags them.  Drop
+      # `continue-on-error` to make lint errors fail this job as well.
+      - name: Run ESLint
+        continue-on-error: true
+        run: npm run lint
+
+      # The HTML report is for people; the JSON report is what the Quality job
+      # reads.  ESLint exits non-zero when it finds errors, which is expected.
+      - name: Generate the ESLint reports
+        if: always()
+        continue-on-error: true
+        run: |
+          npx eslint . -f html -o eslint-report.html
+          npx eslint . -f json -o eslint-report.json
+
+      - name: Upload the ESLint reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: eslint-report
+          path: |
+            wolf-cafe-frontend/eslint-report.html
+            wolf-cafe-frontend/eslint-report.json
+          if-no-files-found: warn
+
+  # Turns Checkstyle problems, ESLint problems, and a coverage shortfall into a
+  # red check of its own, separate from "Build backend" and "Lint frontend".
+  # Those two still mean "it compiles and the tests pass"; this one means "it
+  # meets the team's quality bar".  Each problem becomes an annotation, which
+  # GitHub shows on the run page and beside the offending line in a pull
+  # request's "Files changed" tab, and every problem is listed on the run's
+  # summary page.
+  #
+  # The job only reads the reports the other two jobs uploaded - it builds and
+  # tests nothing itself.  The work is done by .github/scripts/quality-check.js.
+  quality:
+    name: Quality
+    runs-on: [ campus ]
+    needs: [ build, lint ]
+    # Run even when a job above failed, so problems are still reported; skip it
+    # only when a newer push cancelled the run.
+    if: ${{ !cancelled() }}
+
+    steps:
+      # Only the script is needed, not the whole project.
+      - name: Check out the quality script
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/scripts
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      # A missing artifact is reported by the check that needs it, below, with
+      # a message pointing at the job that failed to produce it.
+      - name: Download the backend reports
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: backend-reports
+          path: reports/backend
+
+      - name: Download the ESLint reports
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: eslint-report
+          path: reports/frontend
+
+      # Each check is its own step, so a red step names what failed and each
+      # gets its own share of GitHub's annotation limit (10 per kind per step).
+      # `!cancelled()` runs every check even after an earlier one has failed.
+      - name: Check Checkstyle
+        if: ${{ !cancelled() }}
+        run: node .github/scripts/quality-check.js checkstyle reports/backend
+
+      - name: Check ESLint
+        if: ${{ !cancelled() }}
+        run: node .github/scripts/quality-check.js eslint reports/frontend
+
+      # Keep these minimums in step with the `check-coverage` execution in
+      # wolf-cafe-backend/pom.xml.
+      - name: Check coverage
+        if: ${{ !cancelled() }}
+        env:
+          LINE_COVERAGE_MINIMUM: 70
+          BRANCH_COVERAGE_MINIMUM: 50
+        run: node .github/scripts/quality-check.js coverage reports/backend "$LINE_COVERAGE_MINIMUM" "$BRANCH_COVERAGE_MINIMUM"
